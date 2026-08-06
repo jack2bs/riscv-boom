@@ -349,6 +349,7 @@ class WithNMegaBoomsBigCaches(n: Int = 1) extends Config(
               maxBrCount = 20,
               numFetchBufferEntries = 32,
               enablePrefetching = true,
+              enableFastLoadUse = false,        // timing: disable spec load wakeup (incompatible with registered load writeback below)
               numDCacheBanks = 1,
               ftq = FtqParameters(nEntries=40),
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true))

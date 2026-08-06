@@ -38,20 +38,30 @@ class IssueUnitCollapsing(
   val maxShift = dispatchWidth
   val vacants = issue_slots.map(s => !(s.valid)) ++ io.dis_uops.map(_.valid).map(!_.asBool)
   val shamts_oh = Array.fill(numIssueSlots+dispatchWidth) {Wire(UInt(width=maxShift.W))}
-  // track how many to shift up this entry by by counting previous vacant spots
-  def SaturatingCounterOH(count_oh:UInt, inc: Bool, max: Int): UInt = {
-     val next = Wire(UInt(width=max.W))
-     next := count_oh
-     when (count_oh === 0.U && inc) {
-       next := 1.U
-     } .elsewhen (!count_oh(max-1) && inc) {
-       next := (count_oh << 1.U)
-     }
-     next
-  }
+  // Parallel-prefix (Hillis-Steele) saturating vacancy count.
+  // Replaces the original O(numIssueSlots)-deep serial SaturatingCounterOH
+  // chain with an O(log) depth tree. Functionally identical: shamts_oh(i)
+  // encodes min(#vacants in [0, i-1], maxShift) one-hot as
+  // (count==0 -> 0, count c in [1,maxShift] -> (1 << (c-1))).
   shamts_oh(0) := 0.U
-  for (i <- 1 until numIssueSlots + dispatchWidth) {
-    shamts_oh(i) := SaturatingCounterOH(shamts_oh(i-1), vacants(i-1), maxShift)
+  locally {
+    val n  = numIssueSlots + dispatchWidth
+    val cw = log2Ceil(maxShift + 1)
+    def satAdd(a: UInt, b: UInt): UInt = {
+      val s = a +& b
+      (Mux(s > maxShift.U, maxShift.U, s))(cw - 1, 0)
+    }
+    var lvl: IndexedSeq[UInt] = (0 until n).map(i => Mux(vacants(i), 1.U(cw.W), 0.U(cw.W)))
+    var stride = 1
+    while (stride < n) {
+      val s = stride
+      lvl = (0 until n).map(i => if (i >= s) satAdd(lvl(i), lvl(i - s)) else lvl(i))
+      stride *= 2
+    }
+    for (i <- 1 until n) {
+      val cnt = lvl(i - 1)  // exclusive prefix count of vacants in [0, i-1]
+      shamts_oh(i) := Mux(cnt === 0.U, 0.U(maxShift.W), ((1.U << (cnt - 1.U)))(maxShift - 1, 0))
+    }
   }
 
   //-------------------------------------------------------------
@@ -82,7 +92,22 @@ class IssueUnitCollapsing(
 
   val will_be_available = (0 until numIssueSlots).map(i =>
                             (!issue_slots(i).will_be_valid || issue_slots(i).clear) && !(issue_slots(i).in_uop.valid))
-  val num_available = PopCount(will_be_available)
+  // Saturating popcount capped at dispatchWidth. The dispatch-ready signals
+  // only ever test num_available against 0..dispatchWidth-1, so counting higher
+  // is unnecessary; capping keeps every adder narrow and avoids the long carry
+  // chain a full-width PopCount produced on this registered path.
+  val num_available = {
+    val cap = dispatchWidth
+    val cw  = log2Ceil(cap + 1)
+    def satAddA(a: UInt, b: UInt): UInt = {
+      val s = a +& b
+      (Mux(s > cap.U, cap.U, s))(cw - 1, 0)
+    }
+    def reduceSat(xs: IndexedSeq[UInt]): UInt =
+      if (xs.length == 1) xs.head
+      else { val (lo, hi) = xs.splitAt(xs.length / 2); satAddA(reduceSat(lo), reduceSat(hi)) }
+    reduceSat(will_be_available.map(b => Mux(b, 1.U(cw.W), 0.U(cw.W))).toIndexedSeq)
+  }
   for (w <- 0 until dispatchWidth) {
     io.dis_uops(w).ready := RegNext(num_available > w.U)
   }

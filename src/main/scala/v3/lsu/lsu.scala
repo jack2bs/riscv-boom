@@ -112,6 +112,7 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val exe = Vec(memWidth, new LSUExeIO)
 
   val dis_uops    = Flipped(Vec(coreWidth, Valid(new MicroOp)))
+  val dis_uops_valid_early = Input(Vec(coreWidth, Bool()))
   val dis_ldq_idx = Output(Vec(coreWidth, UInt(ldqAddrSz.W)))
   val dis_stq_idx = Output(Vec(coreWidth, UInt(stqAddrSz.W)))
 
@@ -303,6 +304,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Decode stage
   var ld_enq_idx = ldq_tail
   var st_enq_idx = stq_tail
+  // Speculative enqueue indices for the queue-full check ONLY, driven by the
+  // early (pre-stall) dispatch valids instead of dis_fire. This breaks the
+  // coreWidth-long core<->LSU serial chain (dis_fire -> enq_idx -> full ->
+  // dis_stall -> dis_fire). Correct because dispatch is all-or-nothing prefix:
+  // ldq/stq_full(w) only changes fire(w) when no earlier slot stalled, in which
+  // case the early valids equal dis_fire on the firing prefix.
+  var ld_full_idx = ldq_tail
+  var st_full_idx = stq_tail
 
   val stq_nonempty = (0 until numStqEntries).map{ i => stq(i).valid }.reduce(_||_) =/= 0.U
 
@@ -311,16 +320,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   for (w <- 0 until coreWidth)
   {
-    ldq_full = WrapInc(ld_enq_idx, numLdqEntries) === ldq_head
+    ldq_full = WrapInc(ld_full_idx, numLdqEntries) === ldq_head
     io.core.ldq_full(w)    := ldq_full
     io.core.dis_ldq_idx(w) := ld_enq_idx
 
-    stq_full = WrapInc(st_enq_idx, numStqEntries) === stq_head
+    stq_full = WrapInc(st_full_idx, numStqEntries) === stq_head
     io.core.stq_full(w)    := stq_full
     io.core.dis_stq_idx(w) := st_enq_idx
 
     val dis_ld_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_ldq && !io.core.dis_uops(w).bits.exception
     val dis_st_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_stq && !io.core.dis_uops(w).bits.exception
+    val dis_ld_val_early = io.core.dis_uops_valid_early(w) && io.core.dis_uops(w).bits.uses_ldq && !io.core.dis_uops(w).bits.exception
+    val dis_st_val_early = io.core.dis_uops_valid_early(w) && io.core.dis_uops(w).bits.uses_stq && !io.core.dis_uops(w).bits.exception
     when (dis_ld_val)
     {
       ldq(ld_enq_idx).valid                := true.B
@@ -360,6 +371,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                  st_enq_idx)
 
     assert(!(dis_ld_val && dis_st_val), "A UOP is trying to go into both the LDQ and the STQ")
+
+    ld_full_idx = Mux(dis_ld_val_early, WrapInc(ld_full_idx, numLdqEntries), ld_full_idx)
+    st_full_idx = Mux(dis_st_val_early, WrapInc(st_full_idx, numStqEntries), st_full_idx)
   }
 
   ldq_tail := ld_enq_idx
@@ -1213,10 +1227,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                  !io.core.exception && !RegNext(io.core.exception)))
   mem_forward_stq_idx     := forwarding_idx
   mem_forward_stalled     := widthMap(w => ldst_addr_matches(w).reduce(_||_) && !mem_forward_valid(w))
-  perfStldForwardStall    := mem_forward_stalled.reduce(_||_).asUInt
-  perfStldForwardWakeupRetry := PopCount(will_fire_load_wakeup)
-  perfLoadOrderingFailure := PopCount(failed_loads)
-  perfLoadNackRetry       := PopCount(nacking_loads)
+  // TMA observability counters (architecturally invisible): register the per-event
+  // bit-vectors one cycle BEFORE the Wallace PopCount. This pulls the wide popcount and
+  // the core-side 64b accumulate off the deep dcache-nack launch path (s2_req -> MSHR
+  // nack -> nacking_loads). A 1-cycle attribution delay on a free-running stat counter is
+  // functionally exact; the functional uses of these vectors (replay, exceptions) are
+  // untouched.
+  val nacking_loads_perf  = RegNext(nacking_loads, VecInit(Seq.fill(numLdqEntries)(false.B)))
+  val failed_loads_perf   = RegNext(failed_loads,  VecInit(Seq.fill(numLdqEntries)(false.B)))
+  val will_fire_lwk_perf  = RegNext(will_fire_load_wakeup, VecInit(Seq.fill(memWidth)(false.B)))
+  val mem_fwd_stall_perf  = RegNext(mem_forward_stalled.reduce(_||_), false.B)
+  perfStldForwardStall    := mem_fwd_stall_perf.asUInt
+  perfStldForwardWakeupRetry := PopCount(will_fire_lwk_perf)
+  perfLoadOrderingFailure := PopCount(failed_loads_perf)
+  perfLoadNackRetry       := PopCount(nacking_loads_perf)
 
   // Avoid deadlock with a 1-w LSU prioritizing load wakeups > store commits
   // On a 2W machine, load wakeups and store commits occupy separate pipelines,
@@ -1301,11 +1325,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Handle Memory Responses and nacks
   //----------------------------------
+  val ld_iresp = Wire(Vec(memWidth, Valid(chiselTypeOf(io.core.exe(0).iresp.bits))))
+  val ld_fresp = Wire(Vec(memWidth, Valid(chiselTypeOf(io.core.exe(0).fresp.bits))))
   for (w <- 0 until memWidth) {
-    io.core.exe(w).iresp.valid := false.B
-    io.core.exe(w).iresp.bits  := DontCare
-    io.core.exe(w).fresp.valid := false.B
-    io.core.exe(w).fresp.bits  := DontCare
+    ld_iresp(w).valid := false.B
+    ld_iresp(w).bits  := DontCare
+    ld_fresp(w).valid := false.B
+    ld_fresp(w).bits  := DontCare
   }
 
   val dmem_resp_fired = WireInit(widthMap(w => false.B))
@@ -1344,17 +1370,17 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         val send_iresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX
         val send_fresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FLT
 
-        io.core.exe(w).iresp.bits.uop  := ldq(ldq_idx).bits.uop
-        io.core.exe(w).fresp.bits.uop  := ldq(ldq_idx).bits.uop
-        io.core.exe(w).iresp.valid     := send_iresp
-        io.core.exe(w).iresp.bits.data := io.dmem.resp(w).bits.data
-        io.core.exe(w).fresp.valid     := send_fresp
-        io.core.exe(w).fresp.bits.data := io.dmem.resp(w).bits.data
+        ld_iresp(w).bits.uop  := ldq(ldq_idx).bits.uop
+        ld_fresp(w).bits.uop  := ldq(ldq_idx).bits.uop
+        ld_iresp(w).valid     := send_iresp
+        ld_iresp(w).bits.data := io.dmem.resp(w).bits.data
+        ld_fresp(w).valid     := send_fresp
+        ld_fresp(w).bits.data := io.dmem.resp(w).bits.data
 
         assert(send_iresp ^ send_fresp)
         dmem_resp_fired(w) := true.B
 
-        ldq(ldq_idx).bits.succeeded      := io.core.exe(w).iresp.valid || io.core.exe(w).fresp.valid
+        ldq(ldq_idx).bits.succeeded      := ld_iresp(w).valid || ld_fresp(w).valid
         ldq(ldq_idx).bits.debug_wb_data  := io.dmem.resp(w).bits.data
       }
         .elsewhen (io.dmem.resp(w).bits.uop.uses_stq)
@@ -1363,9 +1389,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         stq(io.dmem.resp(w).bits.uop.stq_idx).bits.succeeded := true.B
         when (io.dmem.resp(w).bits.uop.is_amo) {
           dmem_resp_fired(w) := true.B
-          io.core.exe(w).iresp.valid     := true.B
-          io.core.exe(w).iresp.bits.uop  := stq(io.dmem.resp(w).bits.uop.stq_idx).bits.uop
-          io.core.exe(w).iresp.bits.data := io.dmem.resp(w).bits.data
+          ld_iresp(w).valid     := true.B
+          ld_iresp(w).bits.uop  := stq(io.dmem.resp(w).bits.uop.stq_idx).bits.uop
+          ld_iresp(w).bits.data := io.dmem.resp(w).bits.data
 
           stq(io.dmem.resp(w).bits.uop.stq_idx).bits.debug_wb_data := io.dmem.resp(w).bits.data
         }
@@ -1392,12 +1418,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                 wb_forward_ld_addr(w),
                                 storegen.data, false.B, coreDataBytes)
 
-      io.core.exe(w).iresp.valid := (forward_uop.dst_rtype === RT_FIX) && data_ready && live
-      io.core.exe(w).fresp.valid := (forward_uop.dst_rtype === RT_FLT) && data_ready && live
-      io.core.exe(w).iresp.bits.uop  := forward_uop
-      io.core.exe(w).fresp.bits.uop  := forward_uop
-      io.core.exe(w).iresp.bits.data := loadgen.data
-      io.core.exe(w).fresp.bits.data := loadgen.data
+      ld_iresp(w).valid := (forward_uop.dst_rtype === RT_FIX) && data_ready && live
+      ld_fresp(w).valid := (forward_uop.dst_rtype === RT_FLT) && data_ready && live
+      ld_iresp(w).bits.uop  := forward_uop
+      ld_fresp(w).bits.uop  := forward_uop
+      ld_iresp(w).bits.data := loadgen.data
+      ld_fresp(w).bits.data := loadgen.data
 
       when (data_ready && live) {
         wb_forward_success(w) := true.B
@@ -1411,12 +1437,23 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }
   perfStldForwardSuccess := PopCount(wb_forward_success)
 
+  // Timing: register the load-writeback result one cycle before it leaves the LSU.
+  // Breaks the dcache-hit -> load-resp/forward-mux -> {issue-wakeup, regfile-write}
+  // combinational cone (all top critical paths) into two pipeline stages. Costs 1
+  // cycle of load-use latency; safe because spec load wakeup is disabled in config.
+  for (w <- 0 until memWidth) {
+    io.core.exe(w).iresp.valid := RegNext(ld_iresp(w).valid, false.B)
+    io.core.exe(w).iresp.bits  := RegNext(ld_iresp(w).bits)
+    io.core.exe(w).fresp.valid := RegNext(ld_fresp(w).valid, false.B)
+    io.core.exe(w).fresp.bits  := RegNext(ld_fresp(w).bits)
+  }
+
   // Initially assume the speculative load wakeup failed
   io.core.ld_miss         := RegNext(io.core.spec_ld_wakeup.map(_.valid).reduce(_||_))
   val spec_ld_succeed = widthMap(w =>
     !RegNext(io.core.spec_ld_wakeup(w).valid) ||
-    (io.core.exe(w).iresp.valid &&
-      io.core.exe(w).iresp.bits.uop.ldq_idx === RegNext(mem_incoming_uop(w).ldq_idx)
+    (ld_iresp(w).valid &&
+      ld_iresp(w).bits.uop.ldq_idx === RegNext(mem_incoming_uop(w).ldq_idx)
     )
   ).reduce(_&&_)
   when (spec_ld_succeed) {
