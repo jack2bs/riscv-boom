@@ -185,6 +185,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // The individual branch resolutions from each ALU
   val brinfos = Reg(Vec(coreWidth, new BrResolutionInfo()))
+  // Pre-decoded one-hot of each ALU's branch tag, registered alongside brinfos so the
+  // (1.U << br_tag) decoder is hoisted off the high-fanout brupdate.b1 broadcast cone.
+  // br_tag is assigned at rename (known many cycles early), so decoding it before this
+  // register adds no delay to a slack-critical path while removing a barrel shifter from
+  // the launch cone of resolve_mask/mispredict_mask. Equivalent to (valid << br_tag).
+  val brinfo_tag_ohs = Reg(Vec(coreWidth, UInt(maxBrCount.W)))
 
   // "Merged" branch update info from all ALUs
   // brmask contains masks for rapidly clearing mispredicted instructions
@@ -197,12 +203,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   brupdate.b1 := b1
   brupdate.b2 := b2
 
-  for ((b, a) <- brinfos zip exe_units.alu_units) {
+  for (((b, oh), a) <- brinfos zip brinfo_tag_ohs zip exe_units.alu_units) {
     b := a.io.brinfo
     b.valid := a.io.brinfo.valid && !rob.io.flush.valid
+    oh := UIntToOH(a.io.brinfo.uop.br_tag, maxBrCount)
   }
-  b1.resolve_mask := brinfos.map(x => x.valid << x.uop.br_tag).reduce(_|_)
-  b1.mispredict_mask := brinfos.map(x => (x.valid && x.mispredict) << x.uop.br_tag).reduce(_|_)
+  b1.resolve_mask    := (brinfos zip brinfo_tag_ohs).map { case (x, oh) => Mux(x.valid, oh, 0.U) }.reduce(_|_)
+  b1.mispredict_mask := (brinfos zip brinfo_tag_ohs).map { case (x, oh) => Mux(x.valid && x.mispredict, oh, 0.U) }.reduce(_|_)
 
   // Find the oldest mispredict and use it to update indices
   var mispredict_val = false.B
@@ -763,6 +770,20 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
 
 
+    // --- Critical-path retiming of TMA observability accumulation ---
+    // These counters are dontTouch'd diagnostics consumed offline, so attributing
+    // each event one cycle later is functionally and IPC-neutral. Registering the
+    // per-cycle classification/increment terms one stage before the 64-bit
+    // accumulators pulls the wide adds and multi-term reductions (which were
+    // chaining late dcache/lsu/dispatch signals straight into the counters) out
+    // of the long combinational cone.
+    val tma_slot_frontend_bound_r = RegNext(tma_slot_frontend_bound, VecInit(Seq.fill(coreWidth)(false.B)))
+    val tma_slot_backend_bound_r  = RegNext(tma_slot_backend_bound,  VecInit(Seq.fill(coreWidth)(false.B)))
+    val tma_slot_bad_spec_r       = RegNext(tma_slot_bad_spec,       VecInit(Seq.fill(coreWidth)(false.B)))
+    val tma_in_recovery_r         = RegNext(tma_in_recovery, false.B)
+    val tma_fetch_valid_r         = RegNext(tma_fetch_valid, false.B)
+    def tmaPipe(x: UInt): UInt    = RegNext(x, 0.U(x.getWidth.W))
+
     // TMA L1 counters
     // Retiring is counted at commit (arch_valids), not decode, to match instret.
     // Bad speculation is derived at read time as the aggregate remainder:
@@ -774,10 +795,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val tma_ctr_backend_bound  = RegInit(0.U(xLen.W))
     val tma_ctr_bad_spec       = RegInit(0.U(xLen.W))
 
-    tma_ctr_retiring       := tma_ctr_retiring       + PopCount(rob.io.commit.arch_valids.asUInt)
-    tma_ctr_frontend_bound := tma_ctr_frontend_bound + PopCount(tma_slot_frontend_bound.asUInt)
-    tma_ctr_backend_bound  := tma_ctr_backend_bound  + PopCount(tma_slot_backend_bound.asUInt)
-    tma_ctr_bad_spec       := tma_ctr_bad_spec       + PopCount(tma_slot_bad_spec.asUInt) + rob.io.tma_killed_by_branch_count + rob.io.tma_killed_by_rollback_count + rename_stage.io.tma_kill_machine_clear + rename_stage.io.tma_kill_branch_mispredict
+    tma_ctr_retiring       := tma_ctr_retiring       + tmaPipe(PopCount(rob.io.commit.arch_valids.asUInt))
+    tma_ctr_frontend_bound := tma_ctr_frontend_bound + PopCount(tma_slot_frontend_bound_r.asUInt)
+    tma_ctr_backend_bound  := tma_ctr_backend_bound  + PopCount(tma_slot_backend_bound_r.asUInt)
+    tma_ctr_bad_spec       := tma_ctr_bad_spec       + tmaPipe(PopCount(tma_slot_bad_spec_r.asUInt) + rob.io.tma_killed_by_branch_count + rob.io.tma_killed_by_rollback_count + rename_stage.io.tma_kill_machine_clear + rename_stage.io.tma_kill_branch_mispredict)
 
     dontTouch(tma_ctr_retiring)
     dontTouch(tma_ctr_frontend_bound)
@@ -788,10 +809,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val tma_ctr_fetch_latency   = RegInit(0.U(xLen.W))
     val tma_ctr_fetch_bandwidth = RegInit(0.U(xLen.W))
 
-    val frontend_slots_this_cycle = PopCount(tma_slot_frontend_bound.asUInt)
-    when (!tma_in_recovery && !tma_fetch_valid) {
+    val frontend_slots_this_cycle = PopCount(tma_slot_frontend_bound_r.asUInt)
+    when (!tma_in_recovery_r && !tma_fetch_valid_r) {
       tma_ctr_fetch_latency := tma_ctr_fetch_latency + frontend_slots_this_cycle
-    } .elsewhen (!tma_in_recovery && tma_fetch_valid && frontend_slots_this_cycle > 0.U) {
+    } .elsewhen (!tma_in_recovery_r && tma_fetch_valid_r && frontend_slots_this_cycle > 0.U) {
       tma_ctr_fetch_bandwidth := tma_ctr_fetch_bandwidth + frontend_slots_this_cycle
     }
 
@@ -840,8 +861,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         // where the IQs are full (blocking any dispatch) and there
         // is an outstanding refill request in dcache
     }))
-    tma_ctr_memory_bound := tma_ctr_memory_bound + mem_bound_slots
-    tma_ctr_core_bound   := tma_ctr_core_bound + (PopCount(tma_slot_backend_bound.asUInt) - mem_bound_slots)
+    val mem_bound_slots_r = RegNext(mem_bound_slots, 0.U(mem_bound_slots.getWidth.W))
+    tma_ctr_memory_bound := tma_ctr_memory_bound + mem_bound_slots_r
+    tma_ctr_core_bound   := tma_ctr_core_bound + (PopCount(tma_slot_backend_bound_r.asUInt) - mem_bound_slots_r)
 
     dontTouch(tma_ctr_memory_bound)
     dontTouch(tma_ctr_core_bound)
@@ -1036,9 +1058,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val tma_ctr_load_nack_retries           = RegInit(0.U(xLen.W))
 
     if (boomParams.enableMemOrderCounters) {
-      tma_ctr_stld_fwd_stall_cycles   := tma_ctr_stld_fwd_stall_cycles + io.lsu.perf.stldForwardStall
-      tma_ctr_stld_fwd_success        := tma_ctr_stld_fwd_success + io.lsu.perf.stldForwardSuccess
-      tma_ctr_stld_fwd_wakeup_retries := tma_ctr_stld_fwd_wakeup_retries + io.lsu.perf.stldForwardWakeupRetry
+      tma_ctr_stld_fwd_stall_cycles   := tma_ctr_stld_fwd_stall_cycles + tmaPipe(io.lsu.perf.stldForwardStall)
+      tma_ctr_stld_fwd_success        := tma_ctr_stld_fwd_success + tmaPipe(io.lsu.perf.stldForwardSuccess)
+      tma_ctr_stld_fwd_wakeup_retries := tma_ctr_stld_fwd_wakeup_retries + tmaPipe(io.lsu.perf.stldForwardWakeupRetry)
       tma_ctr_stld_block_load_wakeup  := tma_ctr_stld_block_load_wakeup + io.lsu.perf.stldBlockLoadWakeup
       tma_ctr_mem_order_failures      := tma_ctr_mem_order_failures +
         (io.lsu.lxcpt.valid && io.lsu.lxcpt.bits.cause === MINI_EXCEPTION_MEM_ORDERING)
@@ -1841,6 +1863,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   for (w <- 0 until coreWidth) {
     io.lsu.dis_uops(w).valid := dis_fire(w)
     io.lsu.dis_uops(w).bits  := dis_uops(w)
+    io.lsu.dis_uops_valid_early(w) := dis_valids(w)
   }
 
   // tell LSU about committing loads and stores to clear entries

@@ -550,8 +550,18 @@ class Rob(
 
   } //for (w <- 0 until coreWidth)
 
-  io.tma_killed_by_branch_count := tma_killed_by_branch_per_bank.map(bank => PopCount(bank.asUInt)).reduce(_ +& _)
-  io.tma_killed_by_rollback_count := tma_killed_by_rollback_per_bank.map(bank => PopCount(bank.asUInt)).reduce(_ +& _)
+  // TMA observability counters (architecturally invisible): register the per-bank
+  // kill bit-vectors one cycle BEFORE the wide PopCount so the ~4.6ns popcount + the
+  // core-side 64b accumulate no longer sit in series with the kill-determination logic.
+  // A 1-cycle attribution delay on a free-running stat counter is functionally exact.
+  val tma_killed_by_branch_bits_r = RegNext(
+    VecInit(tma_killed_by_branch_per_bank.flatten),
+    VecInit(Seq.fill(coreWidth * numRobRows)(false.B)))
+  val tma_killed_by_rollback_bits_r = RegNext(
+    VecInit(tma_killed_by_rollback_per_bank.flatten),
+    VecInit(Seq.fill(coreWidth * numRobRows)(false.B)))
+  io.tma_killed_by_branch_count   := PopCount(tma_killed_by_branch_bits_r.asUInt)
+  io.tma_killed_by_rollback_count := PopCount(tma_killed_by_rollback_bits_r.asUInt)
 
   // **************************************************************************
   // --------------------------------------------------------------------------
