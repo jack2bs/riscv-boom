@@ -818,28 +818,31 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val tma_ctr_memory_bound = RegInit(0.U(xLen.W))
     val tma_ctr_core_bound   = RegInit(0.U(xLen.W))
 
-    // Per-slot signal: this slot's instruction is valid and stalled specifically because the IQ is full
-    val dis_iq_full_stall = (0 until coreWidth).map(w =>
-      dis_valids(w) && (!dispatcher.io.ren_uops(w).ready || rob.io.full || ren_stalls(w)))
+    // Memory/core split: classify the CYCLE once, then charge all of the
+    // cycle's backend-bound slots to that cause.
+    //
+    // FIXED (was per-slot): tma_slot_backend_bound(w) is a DECODE-stage flag
+    // but the old qualifier ANDed it with dis_valids(w)/dis_uops(w) at the
+    // DISPATCH stage — same index, different instruction. In the trickle
+    // regime (no structure hard-full; the pipeline drains at miss latency
+    // with dispatch mostly empty) that gate capped memory_bound at
+    // PopCount(dis_valids) and mislabeled the rest core_bound (measured:
+    // 26% on a pure pointer chase with a demand miss outstanding 99% of
+    // cycles). Per-slot hazard terms are also unreliable for younger slots:
+    // dispatch stalls propagate via scanLeft from the oldest blocked slot,
+    // and ldq_full(w) assumes older slots allocated.
+    //
+    // Declared convention (matches Intel TMA practice): memory wins on
+    // overlap — a cycle is memory-bound if a demand L1D refill is in
+    // flight, or memory structures (LDQ/STQ/mem-IQ) backpressure dispatch.
+    val tma_mem_backpressure = (0 until coreWidth).map(w =>
+      dis_valids(w) && ((io.lsu.ldq_full(w) && dis_uops(w).uses_ldq) ||
+                        (io.lsu.stq_full(w) && dis_uops(w).uses_stq))).reduce(_||_) ||
+      tma_mem_iq_full
+    val tma_backend_cycle_is_memory = tma_mem_backpressure || io.lsu.refill_in_flight
 
-    // Per-slot: IQ-full stall while a demand dcache refill is in flight (memory-bound IQ pressure)
-    val dis_iq_full_dcache_miss = (0 until coreWidth).map(w =>
-      (dis_iq_full_stall(w)) && io.lsu.refill_in_flight)
-
-    val refill_blocking_decode = dis_iq_full_dcache_miss.reduce(_||_)
-
-    // Use PopCount to correctly count across all slots (`:=` in a for loop
-    // would only keep the last slot's increment due to last-connect semantics)
-    val mem_bound_slots = PopCount(VecInit((0 until coreWidth).map { w =>
-      tma_slot_backend_bound(w) && dis_valids(w) && (
-        (io.lsu.ldq_full(w) && dis_uops(w).uses_ldq) ||
-        (io.lsu.stq_full(w) && dis_uops(w).uses_stq) ||
-        tma_mem_iq_full ||
-        refill_blocking_decode) 
-        // refill_blocking_decode is a heuristic for memory bound 
-        // where the IQs are full (blocking any dispatch) and there
-        // is an outstanding refill request in dcache
-    }))
+    val mem_bound_slots = Mux(tma_backend_cycle_is_memory,
+                              PopCount(tma_slot_backend_bound.asUInt), 0.U)
     tma_ctr_memory_bound := tma_ctr_memory_bound + mem_bound_slots
     tma_ctr_core_bound   := tma_ctr_core_bound + (PopCount(tma_slot_backend_bound.asUInt) - mem_bound_slots)
 
