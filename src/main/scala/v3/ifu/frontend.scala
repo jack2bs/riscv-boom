@@ -360,6 +360,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_tsrc      = WireInit(0.U(BSRC_SZ.W))
   val s0_valid     = WireInit(false.B)
   val s0_is_replay = WireInit(false.B)
+  // Oracle tap only: s0 re-fetches s2's packet (icache miss or f3 stall) and
+  // no later redirect in this cycle's when-chain overrode it.
+  val s0_is_refetch = WireInit(false.B)
   val s0_is_sfence = WireInit(false.B)
   val s0_replay_resp = Wire(new TLBResp(log2Ceil(fetchBytes)))
   val s0_replay_bpd_resp = Wire(new BranchPredictionBundle)
@@ -500,6 +503,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid := (!s2_tlb_resp.ae.inst && !s2_tlb_resp.pf.inst) || s2_is_replay || s2_tlb_miss
     s0_vpc   := s2_vpc
     s0_is_replay := s2_valid && icache.io.resp.valid
+    s0_is_refetch := true.B
     // When this is not a replay (it queried the BPDs, we should use f3 resp in the replaying s1)
     s0_s1_use_f3_bpd_resp := !s2_is_replay
     s0_ghist := s2_ghist
@@ -516,6 +520,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_valid     := !((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay)
       s0_vpc       := f2_predicted_target
       s0_is_replay := false.B
+      s0_is_refetch := false.B
       s0_ghist     := f2_predicted_ghist
       s2_fsrc      := BSRC_2
       s0_tsrc      := BSRC_2
@@ -848,6 +853,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_valid     := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
       s0_vpc       := f3_predicted_target
       s0_is_replay := false.B
+      s0_is_refetch := false.B
       s0_ghist     := f3_predicted_ghist
       s0_tsrc      := BSRC_3
 
@@ -977,6 +983,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid     := false.B
     s0_vpc       := io.cpu.sfence.bits.addr
     s0_is_replay := false.B
+    s0_is_refetch := false.B
     s0_is_sfence := true.B
 
   }.elsewhen (io.cpu.redirect_flush) {
@@ -993,6 +1000,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ghist     := io.cpu.redirect_ghist
     s0_tsrc      := BSRC_C
     s0_is_replay := false.B
+    s0_is_refetch := false.B
 
     ftq.io.redirect.valid := io.cpu.redirect_val
     ftq.io.redirect.bits  := io.cpu.redirect_ftq_idx
@@ -1000,6 +1008,49 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx
   io.cpu.debug_fetch_pc := ftq.io.debug_fetch_pc
+
+  // Passive tap for the software-oracle BPD (bpd/sw_predictor.scala).
+  // Elaborated ONLY under WithSWOracleBPD (SWOracleTapKey); every other
+  // config takes the else-branch and emits no hardware for this block, so
+  // baseline Verilog is unchanged. Read-only: it exposes the FTQ enqueue
+  // stream and the execute/commit-time redirects to the DPI oracle so it can
+  // identify fetch occurrences exactly instead of inferring them.
+  if (p(boom.v3.ifu.SWOracleTapKey)) {
+    val tap = Module(new boom.v3.ifu.OracleTapHarnessBB(
+      nBanks, bankBytes, fetchBytes, cacheParams.blockBytes, ftqSz)(p))
+    tap.io.clock         := clock
+    tap.io.reset         := reset.asBool
+    tap.io.enq_fire      := ftq.io.enq.fire
+    tap.io.enq_idx       := ftq.io.enq_idx
+    tap.io.enq_pc        := ftq.io.enq.bits.pc
+    tap.io.enq_cfi_valid := ftq.io.enq.bits.cfi_idx.valid
+    tap.io.enq_cfi_idx   := ftq.io.enq.bits.cfi_idx.bits
+    tap.io.red_valid     := io.cpu.redirect_val
+    tap.io.red_pc        := io.cpu.redirect_pc
+    tap.io.red_idx       := io.cpu.redirect_ftq_idx
+    // The f0 fetch pc: the packet whose slots query the predictor NEXT
+    // cycle (published a cycle early so intra-cycle DPI ordering between
+    // this tap and the predictor harnesses cannot matter).
+    tap.io.f0_valid      := s0_valid
+    tap.io.f0_pc         := s0_vpc
+    // s2 re-fetch (icache miss OR f3 could not accept — the first when-block
+    // above): the SAME packet is fetched again, not a new one, and the s1
+    // packet is killed (f1_clear) to be re-fetched afterwards. The oracle
+    // must not advance its serve position for the re-fetch and must rewind
+    // the killed s1 packet. s0_is_replay alone misses the icache-miss case.
+    // ... but only when s0 really re-fetches s2's pc: an f2/f3/CPU redirect
+    // later in this cycle's when-chain overrides s0_vpc, and that fetch is a
+    // new path, not a replay (cubic: the fetch right after a redirect was
+    // flagged and path continuity never recovered). Comparing s0_vpc with
+    // s2_vpc is not enough: a CPU flush whose target IS s2's pc (nettle-aes
+    // start_trigger: the csrr flush-to-next-pc landed on the line s2 was
+    // missing on) still looked like a replay and the oracle lost the path
+    // until the machine's own mispredict resynced it. s0_is_refetch follows
+    // the when-chain exactly: set by the s2 stall block, cleared by every
+    // later override.
+    tap.io.f0_replay     := s0_valid && s0_is_refetch
+    tap.io.f1_kill       := f1_clear && s1_valid
+  }
 
 
   override def toString: String =
