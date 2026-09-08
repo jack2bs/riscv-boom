@@ -839,20 +839,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val tma_ctr_memory_bound = RegInit(0.U(xLen.W))
     val tma_ctr_core_bound   = RegInit(0.U(xLen.W))
 
-    // Memory/core split: classify the CYCLE once, then charge all of the
-    // cycle's backend-bound slots to that cause.
-    //
-    // FIXED (was per-slot): tma_slot_backend_bound(w) is a DECODE-stage flag
-    // but the old qualifier ANDed it with dis_valids(w)/dis_uops(w) at the
-    // DISPATCH stage — same index, different instruction. In the trickle
-    // regime (no structure hard-full; the pipeline drains at miss latency
-    // with dispatch mostly empty) that gate capped memory_bound at
-    // PopCount(dis_valids) and mislabeled the rest core_bound (measured:
-    // 26% on a pure pointer chase with a demand miss outstanding 99% of
-    // cycles). Per-slot hazard terms are also unreliable for younger slots:
-    // dispatch stalls propagate via scanLeft from the oldest blocked slot,
-    // and ldq_full(w) assumes older slots allocated.
-    //
     // Declared convention (matches Intel TMA practice): memory wins on
     // overlap — a cycle is memory-bound if a demand L1D refill is in
     // flight, or memory structures (LDQ/STQ/mem-IQ) backpressure dispatch.
